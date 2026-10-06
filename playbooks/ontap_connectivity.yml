@@ -1,0 +1,21 @@
+---
+- name: Test ONTAP REST API connectivity
+  hosts: all
+  gather_facts: false
+
+  tasks:
+    - name: Read ONTAP cluster and node information
+      netapp.ontap.na_ontap_rest_info:
+        hostname: "{{ ontap_hostname }}"
+        username: "{{ ontap_username }}"
+        password: "{{ ontap_password }}"
+        https: true
+        validate_certs: false
+        gather_subset:
+          - cluster/software
+          - cluster/nodes
+      register: ontap_result
+
+    - name: Display information returned by ONTAP
+      ansible.builtin.debug:
+        var: ontap_result.ontap_info

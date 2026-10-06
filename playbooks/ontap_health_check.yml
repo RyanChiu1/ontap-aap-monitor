@@ -1,0 +1,188 @@
+---
+- name: ONTAP health check
+  hosts: all
+  gather_facts: false
+
+  vars:
+    aggregate_warning_percent: 85
+    volume_warning_percent: 90
+
+  tasks:
+    - name: Initialize alert list
+      ansible.builtin.set_fact:
+        monitoring_alerts: []
+
+    - name: Gather node information
+      netapp.ontap.na_ontap_rest_info:
+        hostname: "{{ ontap_hostname }}"
+        username: "{{ ontap_username }}"
+        password: "{{ ontap_password }}"
+        https: true
+        validate_certs: false
+        use_python_keys: true
+        gather_subset:
+          - cluster/nodes
+        fields:
+          - name
+          - state
+          - healthy
+          - uptime
+      register: node_result
+
+    - name: Display node status
+      ansible.builtin.debug:
+        msg: >-
+          Node {{ item.name }}:
+          state={{ item.state | default('unknown') }},
+          healthy={{ item.healthy | default('unknown') }},
+          uptime={{ item.uptime | default('unknown') }} seconds
+      loop: "{{ node_result.ontap_info.cluster_nodes.records | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Record unhealthy nodes
+      ansible.builtin.set_fact:
+        monitoring_alerts: >-
+          {{
+            monitoring_alerts +
+            ['NODE ' ~ item.name ~
+             ': state=' ~ (item.state | default('unknown') | string) ~
+             ', healthy=' ~ (item.healthy | default('unknown') | string)]
+          }}
+      loop: "{{ node_result.ontap_info.cluster_nodes.records | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - >
+          (item.state | default('unknown')) != 'up' or
+          not (item.healthy | default(false) | bool)
+
+    - name: Gather aggregate information
+      netapp.ontap.na_ontap_rest_info:
+        hostname: "{{ ontap_hostname }}"
+        username: "{{ ontap_username }}"
+        password: "{{ ontap_password }}"
+        https: true
+        validate_certs: false
+        use_python_keys: true
+        gather_subset:
+          - storage/aggregates
+        fields:
+          - name
+          - state
+          - node.name
+          - space.block_storage.used
+          - space.block_storage.available
+      register: aggregate_result
+
+    - name: Display aggregate status
+      vars:
+        aggregate_total_bytes: >-
+          {{
+            (item.space.block_storage.used | int) +
+            (item.space.block_storage.available | int)
+          }}
+        aggregate_used_percent: >-
+          {{
+            (
+              (item.space.block_storage.used | float) * 100 /
+              (aggregate_total_bytes | float)
+            ) | round(1)
+            if (aggregate_total_bytes | int) > 0 else 0
+          }}
+      ansible.builtin.debug:
+        msg: >-
+          Aggregate {{ item.name }}:
+          node={{ item.node.name }},
+          state={{ item.state }},
+          used={{ aggregate_used_percent }}%
+      loop: "{{ aggregate_result.ontap_info.storage_aggregates.records | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Record aggregate alerts
+      vars:
+        aggregate_total_bytes: >-
+          {{
+            (item.space.block_storage.used | int) +
+            (item.space.block_storage.available | int)
+          }}
+        aggregate_used_percent: >-
+          {{
+            (
+              (item.space.block_storage.used | float) * 100 /
+              (aggregate_total_bytes | float)
+            ) | round(1)
+            if (aggregate_total_bytes | int) > 0 else 0
+          }}
+      ansible.builtin.set_fact:
+        monitoring_alerts: >-
+          {{
+            monitoring_alerts +
+            ['AGGREGATE ' ~ item.name ~
+             ': state=' ~ (item.state | string) ~
+             ', used=' ~ (aggregate_used_percent | string) ~ '%']
+          }}
+      loop: "{{ aggregate_result.ontap_info.storage_aggregates.records | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - >
+          item.state != 'online' or
+          (aggregate_used_percent | float) >= (aggregate_warning_percent | float)
+
+    - name: Gather volume information
+      netapp.ontap.na_ontap_rest_info:
+        hostname: "{{ ontap_hostname }}"
+        username: "{{ ontap_username }}"
+        password: "{{ ontap_password }}"
+        https: true
+        validate_certs: false
+        use_python_keys: true
+        gather_subset:
+          - storage/volumes
+        fields:
+          - name
+          - state
+          - svm.name
+          - type
+          - space.percent_used
+      register: volume_result
+
+    - name: Display volume status
+      ansible.builtin.debug:
+        msg: >-
+          Volume {{ item.svm.name }}:{{ item.name }}:
+          state={{ item.state }},
+          used={{ item.space.percent_used | default('unknown') }}%
+      loop: "{{ volume_result.ontap_info.storage_volumes.records | default([]) }}"
+      loop_control:
+        label: "{{ item.svm.name }}:{{ item.name }}"
+
+    - name: Record volume alerts
+      ansible.builtin.set_fact:
+        monitoring_alerts: >-
+          {{
+            monitoring_alerts +
+            ['VOLUME ' ~ item.svm.name ~ ':' ~ item.name ~
+             ': state=' ~ (item.state | string) ~
+             ', used=' ~ (item.space.percent_used | default('unknown') | string) ~ '%']
+          }}
+      loop: "{{ volume_result.ontap_info.storage_volumes.records | default([]) }}"
+      loop_control:
+        label: "{{ item.svm.name }}:{{ item.name }}"
+      when:
+        - >
+          item.state != 'online' or
+          (item.space.percent_used | default(0) | float) >=
+          (volume_warning_percent | float)
+
+    - name: Report healthy status
+      ansible.builtin.debug:
+        msg: "ONTAP health check passed. No alerts detected."
+      when: monitoring_alerts | length == 0
+
+    - name: Fail job when alerts are detected
+      ansible.builtin.fail:
+        msg: "{{ monitoring_alerts | join('\n') }}"
+      when: monitoring_alerts | length > 0
